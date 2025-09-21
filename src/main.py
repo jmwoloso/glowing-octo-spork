@@ -8,8 +8,9 @@ from sklearn.feature_selection import chi2, SelectKBest
 from sklearn.preprocessing import OneHotEncoder
 from sklearn.linear_model import LogisticRegression
 from sklearn.compose import ColumnTransformer
-from sklearn.calibration import CalibratedClassifierCV, calibration_curve, CalibrationDisplay
+from sklearn.calibration import calibration_curve, CalibrationDisplay
 from sklearn.metrics import roc_auc_score, brier_score_loss
+from sklearn.inspection import permutation_importance
 import matplotlib.pyplot as plt
 
 
@@ -35,6 +36,8 @@ CAT_FEATS = ['term', 'sub_grade', 'emp_title', 'emp_length', 'home_ownership',
 DEFAULT_STATUS = ['Charged Off', 'Late (31-120 days)']
 NONDEFAULT_STATUS = ['Fully Paid', 'Current', 'In Grace Period', 'Late (16-30 days)']
 
+BUDGET = 50000
+
 
 def process_data():
     """
@@ -47,6 +50,7 @@ def process_data():
 
     train_data = pd.DataFrame
     test_data = pd.DataFrame
+    backtest_data = pd.DataFrame
 
     # Load in train data
     for file_name in TRAIN_FILE_NAMES:
@@ -64,35 +68,57 @@ def process_data():
             temp = pd.read_csv('data/archive/' + file_name + '.csv', low_memory=False)
             test_data = pd.concat([test_data, temp])
 
+    # Load in backtest data
+    for file_name in BACKTEST_FILE_NAMES:
+        if backtest_data.empty:
+            backtest_data = pd.read_csv('data/archive/' + file_name + '.csv', low_memory=False)
+        else:
+            temp = pd.read_csv('data/archive/' + file_name + '.csv', low_memory=False)
+            backtest_data = pd.concat([backtest_data, temp])
+
     # Cleanup data
     train_data.drop(columns=COLS_TO_RMV, inplace=True)
     train_data['int_rate'] = train_data['int_rate'].str.rstrip('%').astype(float) / 100
     train_data['revol_util'] = train_data['revol_util'].str.rstrip('%').astype(float) / 100
+    train_data['term'] = train_data['term'].str.rstrip(' months').astype(int)
     train_data.dropna(axis=1, how='all')
 
-    test_data.drop(columns=COLS_TO_RMV, inplace=True)
+    # test_data.drop(columns=COLS_TO_RMV, inplace=True)
     test_data['int_rate'] = test_data['int_rate'].str.rstrip('%').astype(float) / 100
     test_data['revol_util'] = test_data['revol_util'].str.rstrip('%').astype(float) / 100
+    test_data['term'] = test_data['term'].str.rstrip(' months').astype(int)
     test_data.dropna(axis=1, how='all')
+
+    # backtest_data.drop(columns=COLS_TO_RMV, inplace=True)
+    backtest_data['int_rate'] = backtest_data['int_rate'].str.rstrip('%').astype(float) / 100
+    backtest_data['revol_util'] = backtest_data['revol_util'].str.rstrip('%').astype(float) / 100
+    backtest_data['term'] = backtest_data['term'].str.rstrip(' months').astype(int)
+    backtest_data.dropna(axis=1, how='all')
 
     # Change loan_status into default
     train_data['default_status'] = train_data['loan_status'].map(lambda x:
-                        '1' if x in DEFAULT_STATUS
-                        else '0')
+                        1 if x in DEFAULT_STATUS
+                        else 0)
 
     test_data['default_status'] = test_data['loan_status'].map(lambda x:
-                        '1' if x in DEFAULT_STATUS
-                        else '0')
+                        1 if x in DEFAULT_STATUS
+                        else 0)
+
+    backtest_data['default_status'] = test_data['loan_status'].map(lambda x:
+                        1 if x in DEFAULT_STATUS
+                        else 0)
 
     X_train = train_data.drop(['loan_status', 'default_status'], axis=1)
     y_train = train_data[['default_status']]
     X_test = test_data.drop('default_status', axis=1)
     y_test = test_data[['default_status']]
+    X_backtest = test_data.drop('default_status', axis=1)
+    y_backtest = test_data[['default_status']]
 
-    return X_train, y_train, X_test, y_test
+    return X_train, y_train, X_test, y_test, X_backtest, y_backtest
 
 
-def pipeline(X_train, y_train, X_test, y_test, calibration=None):
+def pipeline(X_train, y_train, X_test, y_test):
     """
     Finish preprocessing the data, train the model, and calculate/print scores. Option of
     doing no calibration, isotonic calibration, and/or sigmoid calibration.
@@ -120,59 +146,138 @@ def pipeline(X_train, y_train, X_test, y_test, calibration=None):
     )
 
     # Train Model and Calculate Scores/Probablities
-    if calibration is None or calibration == 'all':
-        clf.fit(X_train, y_train.values.ravel())
-        prob_pos_clf = clf.predict_proba(X_test)[:, 1]
-        clf_roc_score = roc_auc_score(y_test, prob_pos_clf)
-        clf_brier_score = brier_score_loss(y_test.astype(int), prob_pos_clf)
+    clf.fit(X_train, y_train.values.ravel())
+    prob_pos_clf = clf.predict_proba(X_test)[:, 1]
+    clf_roc_score = roc_auc_score(y_test, prob_pos_clf)
+    clf_brier_score = brier_score_loss(y_test, prob_pos_clf)
 
-        print('With No Calibration')
-        print('  Accuracy Score: ', clf.score(X_test, y_test))
-        print('  ROC-AUC Score: ', clf_roc_score)
-        print('  Brier Score: ', clf_brier_score)
+    prob_true, prob_pred = calibration_curve(y_test, prob_pos_clf, n_bins=25)
 
-    if calibration == 'isotonic' or calibration == 'all':
-        clf_isotonic = CalibratedClassifierCV(clf, cv=2, method='isotonic')
-        clf_isotonic.fit(X_train, y_train.values.ravel())
-        prob_pos_isotonic = clf_isotonic.predict_proba(X_test)[:, 1]
-        isotonic_roc_score = roc_auc_score(y_test, prob_pos_isotonic)
-        isotonic_brier_score = brier_score_loss(y_test.astype(int), prob_pos_isotonic)
-        isotonic_prob_true, isotonic_prob_pred = calibration_curve(y_test.astype(int), prob_pos_isotonic, n_bins=10)
+    print('Accuracy Score: ', clf.score(X_test, y_test))
+    print('ROC-AUC Score: ', clf_roc_score)
+    print('Calibration (Reliability Curve):')
+    print('  Fraction of Positives: ', prob_true)
+    print('  Mean Predicted Probability: ', prob_pred)
+    print('Brier Score: ', clf_brier_score)
+    print()
 
-        print('With Isotonic Calibration')
-        print('  Accuracy Score: ', clf_isotonic.score(X_test, y_test))
-        print('  ROC-AUC Score: ', isotonic_roc_score)
-        print('  Calibration (Reliability Curve):')
-        print('    Fraction of Positivies: ', isotonic_prob_true)
-        print('    Mean Predicted Probability: ', isotonic_prob_pred)
-        print('  Brier Score: ', isotonic_brier_score)
+    disp = CalibrationDisplay.from_predictions(y_test, prob_pos_clf, n_bins=25)
+    plt.savefig('calibration_curve.png')
 
-        disp = CalibrationDisplay.from_predictions(y_test, prob_pos_isotonic, n_bins=10)
-        plt.savefig('isotonic_calibration_curve.png')
+    return clf
 
-    if calibration == 'sigmoid' or calibration == 'all':
-        clf_sigmoid = CalibratedClassifierCV(clf, cv=2, method='sigmoid')
-        clf_sigmoid.fit(X_train, y_train.values.ravel())
-        prob_pos_sigmoid = clf_sigmoid.predict_proba(X_test)[:, 1]
-        sigmoid_roc_score = roc_auc_score(y_test, prob_pos_sigmoid)
-        sigmoid_brier_score = brier_score_loss(y_test.astype(int), prob_pos_sigmoid)
-        sigmoid_prob_true, sigmoid_prob_pred = calibration_curve(y_test.astype(int), prob_pos_sigmoid, n_bins=10)
 
-        print('With Sigmoid Calibration')
-        print('  Accuracy Score: ', clf_sigmoid.score(X_test, y_test))
-        print('  ROC-AUC Score: ', sigmoid_roc_score)
-        print('  Calibration (Reliability Curve):')
-        print('    Fraction of Positivies: ', sigmoid_prob_true)
-        print('    Mean Predicted Probability: ', sigmoid_prob_pred)
-        print('  Brier Score: ', sigmoid_brier_score)
+def backtest(clf, X_backtest, y_backtest):
+    """
+    Determines which loans to invest in based on the minimum PD and calculates the ROI proxy
+    for these loans.
+    """
+    # Find loans to invest in
+    prob_pos_clf = clf.predict_proba(X_backtest)[:, 1]
+    X_backtest['prob_default'] = prob_pos_clf
 
-        disp = CalibrationDisplay.from_predictions(y_test, prob_pos_sigmoid, n_bins=10)
-        plt.savefig('sigmoid_calibration_curve.png')
+    # To test that this will work when the PD is not the same for the k_smallest
+    #   rows, uncomment this code; it drops all but one of the smallest PD rows
+    #   this also has an example of a loan that defaults and therefore has a
+    #   negative ROI proxy
+    # condition1 = X_backtest['prob_default'] == 0.016910529536703012
+    # condition2 = X_backtest['id'] != 111865260
+    # indices_to_drop = X_backtest[condition1 & condition2].index
+    # X_backtest.drop(indices_to_drop, inplace=True)
+
+    k_smallest = X_backtest.nsmallest(1, 'prob_default', keep='all')
+    sum_k_smallest = k_smallest['funded_amnt'].sum()
+    count = 2
+
+    while sum_k_smallest < BUDGET:
+        k_smallest = X_backtest.nsmallest(count, 'prob_default', keep='all')
+        sum_k_smallest = k_smallest['funded_amnt'].sum()
+        count += 1
+
+    k_smallest = k_smallest.sort_values("funded_amnt")
+
+    amt_sum = 0
+    indexes = []
+    for index, row in k_smallest.iterrows():
+        amt_sum += row['funded_amnt']
+        if amt_sum >= BUDGET:
+            break
+        indexes.append(index)
+
+    loans_to_invest_in = X_backtest.loc[indexes]
+
+    print('Number of Loans Selected:', len(loans_to_invest_in))
+    print()
+
+    # Selected default rate vs. overall default rate
+    print('Default rate(s) for selected loans:', loans_to_invest_in['prob_default'].unique())
+    print('Minimum default rate:', X_backtest['prob_default'].min())
+    print('Maximum default rate:', X_backtest['prob_default'].max())
+    print('Average default rate:', X_backtest['prob_default'].mean())
+    print()
+
+    loan_info_w_roi = loans_to_invest_in[['id', 'loan_status', 'funded_amnt', 'prob_default']].copy()
+    loan_info_w_roi['collected_payments'] = np.nan
+    loan_info_w_roi['ROI_proxy'] = np.nan
+
+    for index, row in loans_to_invest_in.iterrows():
+        collected_payments = 0
+
+        # if default
+        if row['loan_status'] in DEFAULT_STATUS:
+            collected_payments = 0.30 * row['installment'] * row['term']
+        # if not default
+        else:
+            collected_payments = row['installment'] * row['term']
+
+        ROI_proxy = (collected_payments - row['funded_amnt']) / row['funded_amnt']
+
+        loan_info_w_roi.loc[index, 'collected_payments'] = collected_payments
+        loan_info_w_roi.loc[index, 'ROI_proxy'] = ROI_proxy
+
+    print('Loans Selected to Invest In')
+    print(loan_info_w_roi.to_markdown(index=False))
+
+
+def feature_importance(clf, X_train, y_train):
+    """
+    Calculates permutation feature importance and prints the features in order of most to
+        least importance.
+    """
+    # This takes a really long time to run, the contents of importances_mean is the
+    #   return of perm_imp['importances_mean']
+    # perm_imp = permutation_importance(clf, X_train, y_train, random_state=0, scoring='roc_auc', n_repeats=20, n_jobs=-2, max_samples=10000)
+    # print(perm_imp['importances_mean'])
+    importances_mean = [0.00866953, 0.00866953, 0.01056244, 0.00866953, 0.00866953, 0.10624905,
+        0.00866953, 0.00866953, 0.02943634, 0.00866953, 0.02572951, 0.00866953,
+        0.00866953, 0.00866953, 0.00866953, 0.00866953, 0.00866953, 0.00866953,
+        0.00866953, 0.00866953, 0.00866953, 0.00866953, 0.00866953, 0.00866953,
+        0.00866953, 0.00866953, 0.00866953, 0.00866953, 0.00866953, 0.00866953,
+        0.00866953, 0.00866953, 0.00866953, 0.00866953, 0.00866953, 0.00866953,
+        0.00866953, 0.00866953, 0.00866953, 0.00866953, 0.00866953, 0.00866953,
+        0.00866953, 0.00866953, 0.00866953, 0.00866953, 0.00866953, 0.00866953,
+        0.00866953, 0.00866953, 0.00866953, 0.00866953, 0.00866953, 0.00866953,
+        0.00866953, 0.00866953, 0.00866953, 0.00866953, 0.00866953, 0.00866953,
+        0.00866953, 0.00866953, 0.00866953, 0.00866953, 0.00866953, 0.00866953,
+        0.00866953, 0.00866953, 0.00866953, 0.00866953, 0.00866953, 0.00866953,
+        0.00866953, 0.00866953, 0.00866953, 0.00866953, 0.00866953, 0.00866953,
+        0.00866953, 0.00866953, 0.00866953, 0.00866953, 0.00866953, 0.00866953,
+        0.00866953, 0.00866953, 0.00866953, 0.00866953, 0.00866953, 0.00866953,
+        0.00866953, 0.00866953, 0.00866953, 0.00866953]
+    sorted_im = pd.DataFrame(sorted(zip(importances_mean, X_train.columns), reverse=True), columns=['importance_mean', 'feature'])
+    print()
+    print(sorted_im)
+
 
 def main():
-    X_train, y_train, X_test, y_test = process_data()
+    X_train, y_train, X_test, y_test, X_backtest, y_backtest = process_data()
 
-    pipeline(X_train, y_train, X_test, y_test, 'all')
+    clf = pipeline(X_train, y_train, X_test, y_test)
+
+    backtest(clf, X_backtest, y_backtest)
+
+    feature_importance(clf, X_train, y_train)
+
 
 
 if __name__ == '__main__':
